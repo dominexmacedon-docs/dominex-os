@@ -30,8 +30,7 @@ jobs:
       SOURCE_REPO: dominexmacedon-docs/Dominex-Core
       ARTIFACT_ID: ${{ github.event.client_payload.artifact_id || inputs.artifact_id }}
       SOURCE_RUN_ID: ${{ github.event.client_payload.run_id || inputs.run_id }}
-      SOURCE_RUN_NUMBER: ${{ github.event.client_payload.run_number || inputs.run_id }}
-      SOURCE_SHA: ${{ github.event.client_payload.source_sha || 'manual-dispatch' }}
+      EXPECTED_SOURCE_SHA: ${{ github.event.client_payload.source_sha || '' }}
       DOMINEX_CORE_TOKEN: ${{ secrets.DOMINEX_CORE_TOKEN }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -40,7 +39,7 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-utils gzip coreutils unzip
 
-      - name: Validate inputs and download exact artifact
+      - name: Validate successful source run and download exact artifact
         run: |
           set -euo pipefail
           [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || { echo "Invalid artifact_id." >&2; exit 1; }
@@ -50,12 +49,29 @@ jobs:
             exit 1
           fi
           export GH_TOKEN="$DOMINEX_CORE_TOKEN"
-          ACTUAL_RUN_ID="$(gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID" --jq '.workflow_run.id')"
-          EXPIRED="$(gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID" --jq '.expired')"
-          ARTIFACT_NAME="$(gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID" --jq '.name')"
+
+          RUN_JSON="$(gh api "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID")"
+          RUN_NAME="$(jq -r '.name' <<< "$RUN_JSON")"
+          RUN_CONCLUSION="$(jq -r '.conclusion' <<< "$RUN_JSON")"
+          ACTUAL_SOURCE_SHA="$(jq -r '.head_sha' <<< "$RUN_JSON")"
+          SOURCE_RUN_NUMBER="$(jq -r '.run_number' <<< "$RUN_JSON")"
+          [[ "$RUN_NAME" == "Build Dominex Cloud Image" ]] || { echo "Unexpected source workflow: $RUN_NAME" >&2; exit 1; }
+          [[ "$RUN_CONCLUSION" == "success" ]] || { echo "Source workflow did not succeed: $RUN_CONCLUSION" >&2; exit 1; }
+          if [[ -n "$EXPECTED_SOURCE_SHA" && "$EXPECTED_SOURCE_SHA" != "$ACTUAL_SOURCE_SHA" ]]; then
+            echo "Source commit mismatch: dispatch said $EXPECTED_SOURCE_SHA but run used $ACTUAL_SOURCE_SHA." >&2
+            exit 1
+          fi
+          SOURCE_SHA="$ACTUAL_SOURCE_SHA"
+          echo "Verified successful source run $SOURCE_RUN_ID (run number $SOURCE_RUN_NUMBER, commit $SOURCE_SHA)"
+
+          ARTIFACT_JSON="$(gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID")"
+          ACTUAL_RUN_ID="$(jq -r '.workflow_run.id' <<< "$ARTIFACT_JSON")"
+          EXPIRED="$(jq -r '.expired' <<< "$ARTIFACT_JSON")"
+          ARTIFACT_NAME="$(jq -r '.name' <<< "$ARTIFACT_JSON")"
           [[ "$ACTUAL_RUN_ID" == "$SOURCE_RUN_ID" ]] || { echo "Artifact run mismatch: expected $SOURCE_RUN_ID, got $ACTUAL_RUN_ID." >&2; exit 1; }
           [[ "$EXPIRED" == "false" ]] || { echo "Source artifact has expired." >&2; exit 1; }
           [[ "$ARTIFACT_NAME" == "dominex-core-cloud-image" ]] || { echo "Unexpected artifact name: $ARTIFACT_NAME" >&2; exit 1; }
+
           mkdir -p source-artifact release
           gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID/zip" > source-artifact/build.zip
           test -s source-artifact/build.zip
@@ -68,6 +84,10 @@ jobs:
           qemu-img info Dominex-Core-amd64.qcow2
           cp Dominex-Core-amd64.qcow2 ../../release/
           cd ../..
+          {
+            echo "SOURCE_RUN_NUMBER=$SOURCE_RUN_NUMBER"
+            echo "SOURCE_SHA=$SOURCE_SHA"
+          } >> "$GITHUB_ENV"
           echo "DOMINEX_SOURCE_ARTIFACT_VERIFY_PASS"
 
       - name: Convert QCOW2 to compressed raw disk image
@@ -99,12 +119,13 @@ jobs:
 
           - Source repository: https://github.com/$SOURCE_REPO
           - Source workflow run: https://github.com/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID
+          - Source run number: $SOURCE_RUN_NUMBER
           - Source commit: $SOURCE_SHA
           - Artifact ID: $ARTIFACT_ID
 
           ## Validation and limitations
 
-          The publishing workflow verifies the exact source artifact and checksums, confirms it came from the specified build run, converts the QCOW2 disk to a raw image, and verifies the resulting release checksums. Dominex-Core's automated build workflow boots the image under QEMU and requires the guest's `DOMINEX_BOOT_SELFTEST_PASS` marker before dispatching this release workflow. Review the source workflow run and release notes before production use.
+          The publishing workflow verifies that the exact artifact belongs to a successful Dominex-Core build run, checks the source and resulting image checksums, and converts the QCOW2 disk to a raw image. The source build workflow boots the image under QEMU and requires the guest's `DOMINEX_BOOT_SELFTEST_PASS` marker before it dispatches this release workflow. A separate post-build boot-test workflow also reboots the uploaded artifact under QEMU. Review the source workflow run and these notes before production use.
 
           This is an amd64/x86_64 headless Ubuntu 24.04-derived system with the Linux generic kernel and cloud-init. The current disk layout targets legacy BIOS boot; UEFI-only machines and provider-specific image import formats are not yet guaranteed. The Linux kernel remains responsible for hardware drivers and process execution.
           EOF
