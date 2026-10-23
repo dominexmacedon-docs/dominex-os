@@ -104,7 +104,7 @@ jobs:
 
           ## Validation and limitations
 
-          The publishing workflow verifies the source artifact and checksums and successfully converts the disk image. The Dominex-Core build workflow runs static command tests; image boot validation is performed by the separate **Test Dominex Core Boot** workflow and should be checked before production use.
+          The publishing workflow verifies the exact source artifact and checksums, confirms it came from the specified build run, converts the QCOW2 disk to a raw image, and verifies the resulting release checksums. Dominex-Core's automated build workflow boots the image under QEMU and requires the guest's `DOMINEX_BOOT_SELFTEST_PASS` marker before dispatching this release workflow. Review the source workflow run and release notes before production use.
 
           This is an amd64/x86_64 headless Ubuntu 24.04-derived system with the Linux generic kernel and cloud-init. The current disk layout targets legacy BIOS boot; UEFI-only machines and provider-specific image import formats are not yet guaranteed. The Linux kernel remains responsible for hardware drivers and process execution.
           EOF
