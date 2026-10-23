@@ -84,6 +84,7 @@ jobs:
           qemu-img info Dominex-Core-amd64.qcow2
           cp Dominex-Core-amd64.qcow2 ../../release/
           cd ../..
+          rm -rf source-artifact
           {
             echo "SOURCE_RUN_NUMBER=$SOURCE_RUN_NUMBER"
             echo "SOURCE_SHA=$SOURCE_SHA"
@@ -154,7 +155,6 @@ jobs:
         with:
           name: dominex-os-publish-report-${{ github.run_id }}
           path: |
-            source-artifact/build.zip
             release/SHA256SUMS
             release/RELEASE_NOTES.md
           if-no-files-found: warn
