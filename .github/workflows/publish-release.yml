@@ -1,0 +1,140 @@
+name: Publish Dominex OS Release
+
+on:
+  repository_dispatch:
+    types: [dominex-core-image-ready]
+  workflow_dispatch:
+    inputs:
+      artifact_id:
+        description: Dominex-Core Actions artifact ID
+        required: true
+        type: string
+      run_id:
+        description: Dominex-Core workflow run ID that created the artifact
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dominex-os-release-${{ github.event.client_payload.run_id || inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish the exact Dominex-Core build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_REPO: dominexmacedon-docs/Dominex-Core
+      ARTIFACT_ID: ${{ github.event.client_payload.artifact_id || inputs.artifact_id }}
+      SOURCE_RUN_ID: ${{ github.event.client_payload.run_id || inputs.run_id }}
+      SOURCE_RUN_NUMBER: ${{ github.event.client_payload.run_number || inputs.run_id }}
+      SOURCE_SHA: ${{ github.event.client_payload.source_sha || 'manual-dispatch' }}
+      DOMINEX_CORE_TOKEN: ${{ secrets.DOMINEX_CORE_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install disk-image tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qemu-utils gzip coreutils unzip
+
+      - name: Validate inputs and download exact artifact
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || { echo "Invalid artifact_id." >&2; exit 1; }
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]] || { echo "Invalid run_id." >&2; exit 1; }
+          if [[ -z "${DOMINEX_CORE_TOKEN:-}" ]]; then
+            echo "::error::Set DOMINEX_CORE_TOKEN in this repository. It needs Actions: read on Dominex-Core."
+            exit 1
+          fi
+          export GH_TOKEN="$DOMINEX_CORE_TOKEN"
+          ACTUAL_RUN_ID="$(gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID" --jq '.workflow_run.id')"
+          EXPIRED="$(gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID" --jq '.expired')"
+          ARTIFACT_NAME="$(gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID" --jq '.name')"
+          [[ "$ACTUAL_RUN_ID" == "$SOURCE_RUN_ID" ]] || { echo "Artifact run mismatch: expected $SOURCE_RUN_ID, got $ACTUAL_RUN_ID." >&2; exit 1; }
+          [[ "$EXPIRED" == "false" ]] || { echo "Source artifact has expired." >&2; exit 1; }
+          [[ "$ARTIFACT_NAME" == "dominex-core-cloud-image" ]] || { echo "Unexpected artifact name: $ARTIFACT_NAME" >&2; exit 1; }
+          mkdir -p source-artifact release
+          gh api "repos/$SOURCE_REPO/actions/artifacts/$ARTIFACT_ID/zip" > source-artifact/build.zip
+          test -s source-artifact/build.zip
+          unzip -t source-artifact/build.zip
+          unzip -o source-artifact/build.zip -d source-artifact/extracted
+          cd source-artifact/extracted
+          test -s Dominex-Core-amd64.qcow2
+          test -s SHA256SUMS
+          sha256sum -c SHA256SUMS
+          qemu-img info Dominex-Core-amd64.qcow2
+          cp Dominex-Core-amd64.qcow2 ../../release/
+          cd ../..
+          echo "DOMINEX_SOURCE_ARTIFACT_VERIFY_PASS"
+
+      - name: Convert QCOW2 to compressed raw disk image
+        run: |
+          set -euo pipefail
+          qemu-img convert -p -f qcow2 -O raw release/Dominex-Core-amd64.qcow2 release/Dominex-Core-amd64.img
+          gzip -1 release/Dominex-Core-amd64.img
+          test -s release/Dominex-Core-amd64.img.gz
+          (cd release && sha256sum Dominex-Core-amd64.qcow2 Dominex-Core-amd64.img.gz > SHA256SUMS)
+          (cd release && sha256sum -c SHA256SUMS)
+          qemu-img info release/Dominex-Core-amd64.qcow2
+          ls -lh release
+          echo "DOMINEX_RAW_IMAGE_EXPORT_PASS"
+
+      - name: Write release explanation and provenance
+        run: |
+          cat > release/RELEASE_NOTES.md <<EOF
+          # Dominex Core Cloud OS — build $SOURCE_RUN_ID
+
+          This release was built by the [Dominex-Core development repository](https://github.com/$SOURCE_REPO) and published automatically by [dominex-os](https://github.com/${{ github.repository }}).
+
+          ## Assets
+
+          - **Dominex-Core-amd64.img.gz** — gzip-compressed raw disk image. Decompress before writing it to a physical disk or importing it into a platform that accepts raw images. Writing an image to a disk destroys the disk's existing contents.
+          - **Dominex-Core-amd64.qcow2** — QCOW2 virtual disk for compatible QEMU/KVM-based platforms.
+          - **SHA256SUMS** — checksums for both images.
+
+          ## Build provenance
+
+          - Source repository: https://github.com/$SOURCE_REPO
+          - Source workflow run: https://github.com/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID
+          - Source commit: $SOURCE_SHA
+          - Artifact ID: $ARTIFACT_ID
+
+          ## Validation and limitations
+
+          The publishing workflow verifies the source artifact and checksums and successfully converts the disk image. The Dominex-Core build workflow runs static command tests; image boot validation is performed by the separate **Test Dominex Core Boot** workflow and should be checked before production use.
+
+          This is an amd64/x86_64 headless Ubuntu 24.04-derived system with the Linux generic kernel and cloud-init. The current disk layout targets legacy BIOS boot; UEFI-only machines and provider-specific image import formats are not yet guaranteed. The Linux kernel remains responsible for hardware drivers and process execution.
+          EOF
+          cp release/RELEASE_NOTES.md RELEASE_NOTES.md
+          echo "DOMINEX_RELEASE_NOTES_PASS"
+
+      - name: Create immutable-per-build GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="build-$SOURCE_RUN_ID"
+          gh release create "$TAG" \
+            release/Dominex-Core-amd64.img.gz \
+            release/Dominex-Core-amd64.qcow2 \
+            release/SHA256SUMS \
+            release/RELEASE_NOTES.md \
+            --repo "${{ github.repository }}" \
+            --title "Dominex OS Cloud Image — build $SOURCE_RUN_ID" \
+            --notes-file RELEASE_NOTES.md
+          echo "DOMINEX_OS_RELEASE_PUBLISH_PASS tag=$TAG"
+
+      - name: Upload publishing diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dominex-os-publish-report-${{ github.run_id }}
+          path: |
+            source-artifact/build.zip
+            release/SHA256SUMS
+            release/RELEASE_NOTES.md
+          if-no-files-found: warn
+          retention-days: 30
